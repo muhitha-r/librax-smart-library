@@ -1,0 +1,128 @@
+const mongoose = require('mongoose');
+require('dotenv').config();
+const User = require('../models/User');
+const Book = require('../models/Book');
+const BorrowRecord = require('../models/BorrowRecord');
+const Notification = require('../models/Notification');
+const { generateToken } = require('../utils/jwt');
+const { sendNotification, checkScheduledReminders } = require('../utils/scheduler');
+
+async function runTest() {
+  await mongoose.connect(process.env.MONGODB_URI);
+  console.log('--- TESTING PHASE C: IN-APP NOTIFICATIONS & SCHEDULED REMINDERS ---');
+
+  const student1 = await User.findOne({ email: 'student@librax.com' });
+  const student2 = await User.findOne({ role: 'Student', _id: { $ne: student1._id } });
+  if (!student1 || !student2) throw new Error('Test requires at least two student users in DB.');
+
+  const token1 = generateToken(student1);
+  const token2 = generateToken(student2);
+  const BASE_URL = 'http://localhost:5000';
+
+  // 1. Model Verification: recipient, enum type, read, link
+  const newEnumNotif = await Notification.create({
+    recipient: student1._id,
+    type: 'RESERVATION_CONFIRMATION',
+    title: 'Reservation Confirmed',
+    message: 'Your hold request has been recorded.',
+    read: false,
+    link: '/reservations',
+  });
+  console.log('1. Created Phase C Notification model with new enum & recipient:', newEnumNotif._id);
+  if (!newEnumNotif.recipient || newEnumNotif.read !== false || newEnumNotif.type !== 'RESERVATION_CONFIRMATION') {
+    throw new Error('Notification model schema validation failed');
+  }
+
+  // 2. Fetch notifications for Student 1
+  const getRes = await fetch(BASE_URL + '/api/notifications', {
+    method: 'GET',
+    headers: { Authorization: 'Bearer ' + token1 },
+  });
+  const getData = await getRes.json();
+  console.log('2. Student 1 notifications fetched. Status:', getRes.status, 'Unread count:', getData.unreadCount);
+  const found = getData.data?.find((n) => n._id === newEnumNotif._id.toString());
+  if (!found) throw new Error('Notification not returned in getMyNotifications');
+  if (found.link !== '/reservations') throw new Error('Notification link not returned');
+
+  // 3. User isolation check: Student 2 must NOT see or modify Student 1 notification
+  const s2GetRes = await fetch(BASE_URL + '/api/notifications', {
+    method: 'GET',
+    headers: { Authorization: 'Bearer ' + token2 },
+  });
+  const s2GetData = await s2GetRes.json();
+  const s2Found = s2GetData.data?.find((n) => n._id === newEnumNotif._id.toString());
+  if (s2Found) throw new Error('Security violation: Student 2 can view Student 1 notification!');
+  console.log('3a. User isolation verified: Student 2 cannot see Student 1 notification');
+
+  const s2PatchRes = await fetch(BASE_URL + '/api/notifications/' + newEnumNotif._id + '/read', {
+    method: 'PATCH',
+    headers: { Authorization: 'Bearer ' + token2 },
+  });
+  console.log('3b. Student 2 mark Student 1 notice as read status (should be 404):', s2PatchRes.status);
+  if (s2PatchRes.status !== 404) throw new Error('Security violation: Student 2 can modify Student 1 notification');
+
+  // 4. Student 1 marks notification as read
+  const readRes = await fetch(BASE_URL + '/api/notifications/' + newEnumNotif._id + '/read', {
+    method: 'PATCH',
+    headers: { Authorization: 'Bearer ' + token1 },
+  });
+  const readData = await readRes.json();
+  console.log('4. Mark as read status:', readRes.status, 'read:', readData.data?.read, 'isRead:', readData.data?.isRead);
+  if (!readData.data?.read || !readData.data?.isRead) throw new Error('Notification was not marked as read');
+
+  // 5. Test mark all as read
+  const notif2 = await Notification.create({
+    recipient: student1._id,
+    type: 'GENERAL',
+    title: 'General Library Update',
+    message: 'Testing mark all read bulk update.',
+    read: false,
+    link: '/dashboard',
+  });
+
+  const markAllRes = await fetch(BASE_URL + '/api/notifications/read-all', {
+    method: 'PATCH',
+    headers: { Authorization: 'Bearer ' + token1 },
+  });
+  const markAllData = await markAllRes.json();
+  console.log('5. Mark all read status:', markAllRes.status, 'Unread count:', markAllData.unreadCount);
+  if (markAllData.unreadCount !== 0) throw new Error('Unread count should be 0 after mark-all-read');
+
+  // 6. Test Scheduled Due Date Reminder job
+  console.log('6. Testing node-cron scheduled reminder runner...');
+  const anyBook = await Book.findOne();
+  const testBorrow = await BorrowRecord.create({
+    user: student1._id,
+    book: anyBook._id,
+    borrowDate: new Date(),
+    dueDate: new Date(Date.now() + 12 * 60 * 60 * 1000), // Due in 12 hours (< 24 hours)
+    status: 'Borrowed',
+    renewalCount: 0,
+  });
+
+  await checkScheduledReminders();
+
+  const reminderNotif = await Notification.findOne({
+    recipient: student1._id,
+    type: 'DUE_DATE_REMINDER',
+    relatedId: testBorrow._id,
+  });
+
+  if (!reminderNotif) {
+    throw new Error('DUE_DATE_REMINDER was not generated by checkScheduledReminders');
+  }
+  console.log('6b. DUE_DATE_REMINDER successfully generated for borrowed book due in < 24h:', reminderNotif.title);
+
+  // 7. Cleanup test data
+  await BorrowRecord.findByIdAndDelete(testBorrow._id);
+  await Notification.deleteMany({ _id: { $in: [newEnumNotif._id, notif2._id, reminderNotif._id] } });
+  console.log('7. Cleaned up test borrow records and notifications');
+
+  console.log('--- ALL PHASE C TESTS PASSED WITH 100% SUCCESS ---');
+  await mongoose.disconnect();
+}
+
+runTest().catch((err) => {
+  console.error('Test error:', err);
+  process.exit(1);
+});
