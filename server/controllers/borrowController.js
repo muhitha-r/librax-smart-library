@@ -8,9 +8,10 @@ const { sendNotification, recalculateQueuePositions } = require('../utils/schedu
 
 /**
  * Helper to dynamically synchronize overdue status & calculate fine amount
- * Overdue rate is configurable in BorrowSetting (default ₹5 per day).
+ * Staff role is exempted from fines (fineAmount = 0).
+ * Student role applies standard late fine (₹5 per day default or BorrowSetting).
  */
-function calculateOverdueMetrics(record, finePerDay = 5) {
+function calculateOverdueMetrics(record, finePerDay = 5, borrowerRole = null) {
   const now = new Date();
   const dueDate = new Date(record.dueDate);
   let overdueDays = 0;
@@ -23,7 +24,18 @@ function calculateOverdueMetrics(record, finePerDay = 5) {
     const effMidnight = new Date(effectiveDate.getFullYear(), effectiveDate.getMonth(), effectiveDate.getDate());
     const diffDays = Math.round((effMidnight.getTime() - dueMidnight.getTime()) / (1000 * 60 * 60 * 24));
     overdueDays = Math.max(1, diffDays);
-    computedFine = overdueDays * finePerDay;
+
+    // Determine borrower's role
+    const role =
+      borrowerRole ||
+      (record.user && typeof record.user === 'object' && record.user.role) ||
+      'Student';
+
+    if (role === 'Staff') {
+      computedFine = 0;
+    } else {
+      computedFine = overdueDays * finePerDay;
+    }
 
     if (record.status !== 'Returned') {
       record.status = 'Overdue';
@@ -39,6 +51,8 @@ function calculateOverdueMetrics(record, finePerDay = 5) {
     record.fineAmount = computedFine;
     if (computedFine > 0) {
       record.finePaymentStatus = 'Unpaid';
+    } else if (record.status === 'Returned') {
+      record.finePaymentStatus = 'Paid';
     }
   }
 
@@ -230,7 +244,7 @@ async function getMyBorrowings(req, res, next) {
     for (const rec of activeRecords) {
       const prevStatus = rec.status;
       const prevFine = rec.fineAmount;
-      calculateOverdueMetrics(rec, settings.finePerDay);
+      calculateOverdueMetrics(rec, settings.finePerDay, req.user.role);
       if (rec.status !== prevStatus || rec.fineAmount !== prevFine) {
         await rec.save();
       }
@@ -302,11 +316,11 @@ async function getAllBorrowings(req, res, next) {
     const settings = await BorrowSetting.getSettings();
 
     // Check & sync all active loans overdue metrics
-    const activeRecords = await BorrowRecord.find({ status: { $in: ['Borrowed', 'Overdue'] } });
+    const activeRecords = await BorrowRecord.find({ status: { $in: ['Borrowed', 'Overdue'] } }).populate('user', 'role name email');
     for (const rec of activeRecords) {
       const prevStatus = rec.status;
       const prevFine = rec.fineAmount;
-      calculateOverdueMetrics(rec, settings.finePerDay);
+      calculateOverdueMetrics(rec, settings.finePerDay, rec.user?.role);
       if (rec.status !== prevStatus || rec.fineAmount !== prevFine) {
         await rec.save();
       }
@@ -424,7 +438,7 @@ async function getOverdueBorrowings(req, res, next) {
 
     // Sync live fine amounts
     for (const rec of overdueList) {
-      calculateOverdueMetrics(rec, settings.finePerDay);
+      calculateOverdueMetrics(rec, settings.finePerDay, rec.user?.role);
       await rec.save();
     }
 
@@ -476,7 +490,7 @@ async function getBorrowRecordById(req, res, next) {
 
     // Sync metrics
     const settings = await BorrowSetting.getSettings();
-    calculateOverdueMetrics(record, settings.finePerDay);
+    calculateOverdueMetrics(record, settings.finePerDay, record.user?.role);
     await record.save();
 
     return res.status(200).json({
@@ -506,6 +520,10 @@ async function returnBook(req, res, next) {
       return res.status(404).json({ status: 'error', message: 'Borrowing record not found.' });
     }
 
+    // Determine borrower and role
+    const borrower = await User.findById(record.user).select('role name email');
+    const borrowerRole = borrower?.role || 'Student';
+
     // Check authorization: Admin, Librarian, or the borrower themselves
     const isOwner = record.user.toString() === req.user._id.toString();
     const isPrivileged = req.user.role === 'Admin' || req.user.role === 'Librarian';
@@ -532,7 +550,9 @@ async function returnBook(req, res, next) {
     const returnDate = new Date();
     const dueDate = new Date(record.dueDate);
 
-    // Calculate overdue days and fine amount
+    // Calculate overdue days and fine amount based on role:
+    // If borrower is Staff, fineAmount = 0 (exempted).
+    // If borrower is Student, apply standard late fine (₹5 per day).
     let overdueDays = 0;
     let fineAmount = 0;
 
@@ -541,7 +561,12 @@ async function returnBook(req, res, next) {
       const retMidnight = new Date(returnDate.getFullYear(), returnDate.getMonth(), returnDate.getDate());
       const diffDays = Math.round((retMidnight.getTime() - dueMidnight.getTime()) / (1000 * 60 * 60 * 24));
       overdueDays = Math.max(1, diffDays);
-      fineAmount = overdueDays * (settings.finePerDay || 5);
+
+      if (borrowerRole === 'Staff') {
+        fineAmount = 0;
+      } else {
+        fineAmount = overdueDays * (settings.finePerDay || 5);
+      }
     }
 
     record.returnDate = returnDate;
@@ -560,7 +585,11 @@ async function returnBook(req, res, next) {
       performedBy: req.user._id,
       timestamp: returnDate,
       notes: `Returned by ${req.user.name} (${req.user.role}). ${
-        overdueDays > 0 ? `Overdue by ${overdueDays} day(s) - Fine: ₹${fineAmount}` : 'Returned on time - No fine.'
+        borrowerRole === 'Staff' && overdueDays > 0
+          ? `Overdue by ${overdueDays} day(s) - Fine: ₹0 (Staff Exempted)`
+          : overdueDays > 0
+          ? `Overdue by ${overdueDays} day(s) - Fine: ₹${fineAmount}`
+          : 'Returned on time - No fine.'
       }`,
     });
 
@@ -628,10 +657,14 @@ async function returnBook(req, res, next) {
     return res.status(200).json({
       status: 'success',
       message: `Book '${updatedBook ? updatedBook.title : 'Book'}' returned successfully.${
-        fineAmount > 0 ? ` Overdue fine assessed: ₹${fineAmount} (${overdueDays} days @ ₹${settings.finePerDay}/day).` : ' No fines accrued.'
+        borrowerRole === 'Staff' && overdueDays > 0
+          ? ` Overdue by ${overdueDays} day(s) - Fine exempted for Staff member.`
+          : fineAmount > 0
+          ? ` Overdue fine assessed: ₹${fineAmount} (${overdueDays} days @ ₹${settings.finePerDay || 5}/day).`
+          : ' No fines accrued.'
       }${reservationHold ? ` Reserved for ${reservationHold.reservedUser} (pickup hold until ${reservationHold.holdUntil.toLocaleDateString()}).` : ''}`,
       data: populated,
-      overdueNotice: overdueDays > 0 ? { overdueDays, fineAmount, finePaymentStatus: 'Unpaid' } : null,
+      overdueNotice: overdueDays > 0 ? { overdueDays, fineAmount, finePaymentStatus: fineAmount > 0 ? 'Unpaid' : 'Paid' } : null,
       reservationHold,
     });
   } catch (error) {
