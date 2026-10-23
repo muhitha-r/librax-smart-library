@@ -1,7 +1,23 @@
+# Node dependencies
 node_modules/
+
+# Production build output
 dist/
+dist-ssr/
 build/
+
+# Environment files (Vite)
 .env
-*.env
-server/.env
-client/.env
+.env.local
+.env.production
+.env*.local
+
+# Logs
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# Editor & OS files
+.DS_Store
+Thumbs.db
+.vscode/
